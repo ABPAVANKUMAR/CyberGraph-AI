@@ -1,3 +1,4 @@
+import os
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,27 +14,37 @@ from agent import investigate_alert as run_investigation
 app = FastAPI(
     title="CyberGraph AI API",
     description="Graph-powered cybersecurity investigation platform",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
 # --------------------------------------------------
 # CORS CONFIGURATION
-# Allows the React frontend to communicate with FastAPI
 # --------------------------------------------------
+
+# Local development origins
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+    "http://localhost:5176",
+    "http://127.0.0.1:5176",
+]
+
+# Optional production frontend URL.
+# Configure FRONTEND_URL in Render after deploying the frontend.
+frontend_url = os.getenv("FRONTEND_URL")
+
+if frontend_url:
+    allowed_origins.append(frontend_url.rstrip("/"))
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-        "http://localhost:5176",
-        "http://127.0.0.1:5176",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,20 +53,30 @@ app.add_middleware(
 
 # --------------------------------------------------
 # FALKORDB CONFIGURATION
-# Must match build_graph.py exactly
 # --------------------------------------------------
 
-DB_HOST = "localhost"
-DB_PORT = 6379
-GRAPH_NAME = "CyberGraph"
+DB_HOST = os.getenv("FALKORDB_HOST", "localhost")
+DB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
+DB_USERNAME = os.getenv("FALKORDB_USERNAME")
+DB_PASSWORD = os.getenv("FALKORDB_PASSWORD")
+GRAPH_NAME = os.getenv("FALKORDB_GRAPH", "CyberGraph")
 
 
 def get_graph():
-    """Connect to the CyberGraph graph database."""
-    database = FalkorDB(
-        host=DB_HOST,
-        port=DB_PORT,
-    )
+    """Connect to the configured FalkorDB graph."""
+
+    connection_options = {
+        "host": DB_HOST,
+        "port": DB_PORT,
+    }
+
+    if DB_USERNAME:
+        connection_options["username"] = DB_USERNAME
+
+    if DB_PASSWORD:
+        connection_options["password"] = DB_PASSWORD
+
+    database = FalkorDB(**connection_options)
 
     return database.select_graph(GRAPH_NAME)
 
@@ -68,7 +89,7 @@ def get_graph():
 def home():
     return {
         "application": "CyberGraph AI",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "status": "running",
         "docs": "/docs",
     }
@@ -102,8 +123,6 @@ def health_check():
 
 # --------------------------------------------------
 # GET ALL SECURITY ALERTS
-# Uses a.id because build_graph.py stores the ID
-# in the "id" property, not "alert_id".
 # --------------------------------------------------
 
 @app.get("/api/alerts")
@@ -167,9 +186,7 @@ def get_investigation(alert_id: str):
                 i.username AS identity,
                 asset.name AS connected_asset
             """,
-            {
-                "alert_id": alert_id,
-            },
+            {"alert_id": alert_id},
         )
 
         if not result.result_set:
@@ -226,6 +243,15 @@ def investigate_with_agent(alert_id: str):
                 detail=f"No investigation result for {alert_id}.",
             )
 
+        if result.get("status") == "not_found":
+            raise HTTPException(
+                status_code=404,
+                detail=result.get(
+                    "message",
+                    f"No matching alert was found for {alert_id}.",
+                ),
+            )
+
         return result
 
     except HTTPException:
@@ -236,4 +262,3 @@ def investigate_with_agent(alert_id: str):
             status_code=500,
             detail=f"Agent investigation failed: {str(error)}",
         )
-
