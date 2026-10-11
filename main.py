@@ -1,28 +1,39 @@
 import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+import jwt
+from pwdlib import PasswordHash
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from falkordb import FalkorDB
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr, Field
 
+from falkordb import FalkorDB
 from agent import investigate_alert as run_investigation
 
 
-# --------------------------------------------------
+# ==================================================
 # FASTAPI APPLICATION
-# --------------------------------------------------
+# ==================================================
 
 app = FastAPI(
     title="CyberGraph AI API",
     description="Graph-powered cybersecurity investigation platform",
-    version="1.3.0",
+    version="2.0.0",
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # CORS CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
-# Local development origins
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -34,26 +45,290 @@ allowed_origins = [
     "http://127.0.0.1:5176",
 ]
 
-# Optional production frontend URL.
-# Configure FRONTEND_URL in Render after deploying the frontend.
 frontend_url = os.getenv("FRONTEND_URL")
 
 if frontend_url:
     allowed_origins.append(frontend_url.rstrip("/"))
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
-# --------------------------------------------------
+# ==================================================
+# AUTHENTICATION CONFIGURATION
+# ==================================================
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+if not JWT_SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY is missing. Set it in your environment "
+        "before starting CyberGraph AI."
+    )
+
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+BASE_DIR = Path(__file__).resolve().parent
+AUTH_DB_PATH = BASE_DIR / "users.db"
+
+password_hash = PasswordHash.recommended()
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+# ==================================================
+# USER DATABASE
+# ==================================================
+
+def get_auth_connection():
+    connection = sqlite3.connect(
+        AUTH_DB_PATH,
+        timeout=10,
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_auth_db():
+    with get_auth_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+initialize_auth_db()
+
+
+# ==================================================
+# REQUEST MODELS
+# ==================================================
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=12, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
+
+
+# ==================================================
+# JWT TOKEN GENERATION
+# ==================================================
+
+def create_access_token(user_id: int, email: str) -> str:
+    now = datetime.now(timezone.utc)
+
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "iat": now,
+        "exp": now + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        ),
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+# ==================================================
+# CURRENT USER VERIFICATION
+# ==================================================
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        bearer_scheme
+    ),
+):
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Please log in to continue.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+        )
+
+        user_id = int(payload["sub"])
+
+    except (
+        jwt.InvalidTokenError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Your session is invalid or expired. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    with get_auth_connection() as connection:
+        user = connection.execute(
+            """
+            SELECT id, email, created_at
+            FROM users
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Account not found. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return dict(user)
+
+
+# ==================================================
+# REGISTRATION
+# ==================================================
+
+@app.post("/api/auth/register", status_code=201)
+def register_user(data: RegisterRequest):
+    email = str(data.email).strip().lower()
+
+    hashed_password = password_hash.hash(data.password)
+
+    try:
+        with get_auth_connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO users (
+                    email,
+                    password_hash,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    email,
+                    hashed_password,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+            user_id = cursor.lastrowid
+
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists.",
+        )
+
+    token = create_access_token(user_id, email)
+
+    return {
+        "message": "Registration successful.",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": {
+            "id": user_id,
+            "email": email,
+        },
+    }
+
+
+# ==================================================
+# LOGIN
+# ==================================================
+
+@app.post("/api/auth/login")
+def login_user(data: LoginRequest):
+    email = str(data.email).strip().lower()
+
+    with get_auth_connection() as connection:
+        user = connection.execute(
+            """
+            SELECT id, email, password_hash
+            FROM users
+            WHERE email = ?
+            """,
+            (email,),
+        ).fetchone()
+
+    if user is None or not password_hash.verify(
+        data.password,
+        user["password_hash"],
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+
+    token = create_access_token(
+        user["id"],
+        user["email"],
+    )
+
+    return {
+        "message": "Login successful.",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+        },
+    }
+
+
+# ==================================================
+# CURRENT ACCOUNT
+# ==================================================
+
+@app.get("/api/auth/me")
+def get_my_account(
+    user=Depends(get_current_user),
+):
+    return {
+        "user": user,
+    }
+
+
+# ==================================================
+# ROOT ENDPOINT
+# ==================================================
+
+@app.get("/")
+def home():
+    return {
+        "application": "CyberGraph AI",
+        "version": "2.0.0",
+        "status": "running",
+        "docs": "/docs",
+    }
+
+
+# ==================================================
 # FALKORDB CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 DB_HOST = os.getenv("FALKORDB_HOST", "localhost")
 DB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
@@ -81,23 +356,9 @@ def get_graph():
     return database.select_graph(GRAPH_NAME)
 
 
-# --------------------------------------------------
-# ROOT ENDPOINT
-# --------------------------------------------------
-
-@app.get("/")
-def home():
-    return {
-        "application": "CyberGraph AI",
-        "version": "1.3.0",
-        "status": "running",
-        "docs": "/docs",
-    }
-
-
-# --------------------------------------------------
+# ==================================================
 # HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/api/health")
 def health_check():
@@ -110,23 +371,25 @@ def health_check():
             "database": "connected",
         }
 
-    except Exception as error:
+    except Exception:
+        # Do not expose database credentials or internal errors.
         raise HTTPException(
             status_code=503,
             detail={
-                "api": "healthy",
+                "api": "running",
                 "database": "disconnected",
-                "error": str(error),
             },
         )
 
 
-# --------------------------------------------------
-# GET ALL SECURITY ALERTS
-# --------------------------------------------------
+# ==================================================
+# GET SECURITY ALERTS — LOGIN REQUIRED
+# ==================================================
 
 @app.get("/api/alerts")
-def get_alerts():
+def get_alerts(
+    user=Depends(get_current_user),
+):
     try:
         graph = get_graph()
 
@@ -154,19 +417,22 @@ def get_alerts():
 
         return alerts
 
-    except Exception as error:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not retrieve alerts: {str(error)}",
+            detail="Could not retrieve alerts.",
         )
 
 
-# --------------------------------------------------
-# GET CONNECTED ENTITIES FOR AN ALERT
-# --------------------------------------------------
+# ==================================================
+# INVESTIGATION DETAILS — LOGIN REQUIRED
+# ==================================================
 
 @app.get("/api/investigations/{alert_id}")
-def get_investigation(alert_id: str):
+def get_investigation(
+    alert_id: str,
+    user=Depends(get_current_user),
+):
     try:
         graph = get_graph()
 
@@ -221,19 +487,22 @@ def get_investigation(alert_id: str):
     except HTTPException:
         raise
 
-    except Exception as error:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Investigation query failed: {str(error)}",
+            detail="Investigation query failed.",
         )
 
 
-# --------------------------------------------------
-# AI AGENT INVESTIGATION
-# --------------------------------------------------
+# ==================================================
+# AI AGENT INVESTIGATION — LOGIN REQUIRED
+# ==================================================
 
 @app.get("/api/agent/investigate/{alert_id}")
-def investigate_with_agent(alert_id: str):
+def investigate_with_agent(
+    alert_id: str,
+    user=Depends(get_current_user),
+):
     try:
         result = run_investigation(alert_id)
 
@@ -257,8 +526,8 @@ def investigate_with_agent(alert_id: str):
     except HTTPException:
         raise
 
-    except Exception as error:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Agent investigation failed: {str(error)}",
+            detail="Agent investigation failed.",
         )
